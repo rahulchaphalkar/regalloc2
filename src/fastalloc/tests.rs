@@ -19,7 +19,7 @@ fn limited_operands_and_reuse() {
             vec![op(Use, 0, Limit(1)), op(Use, 2, Limit(16))],
         ],
     }]);
-    for algorithm in [Algorithm::Ion] {
+    for algorithm in [Algorithm::Ion, Algorithm::Fastalloc] {
         let options = RegallocOptions {
             algorithm,
             validate_ssa: true,
@@ -70,7 +70,7 @@ fn limited_operand_with_multiple_fixed_uses() {
         let function = RealFunction::new(vec![BlockBuildInfo {
             insts: vec![vec![op(Def, 0, FixedReg(p(31)))], uses.clone()],
         }]);
-        for algorithm in [Algorithm::Ion] {
+        for algorithm in [Algorithm::Ion, Algorithm::Fastalloc] {
             let options = RegallocOptions {
                 algorithm,
                 validate_ssa: true,
@@ -104,7 +104,7 @@ fn limited_reused_input_live_across() {
             vec![op(Use, 0, Limit(1)), op(Use, 1, Reg)],
         ],
     }]);
-    for algorithm in [Algorithm::Ion] {
+    for algorithm in [Algorithm::Ion, Algorithm::Fastalloc] {
         let options = RegallocOptions {
             algorithm,
             validate_ssa: true,
@@ -133,7 +133,7 @@ fn limited_sparse_registers_and_repeated_uses() {
                 vec![op(Use, 0, Limit(limit)), op(Use, 0, Limit(limit))],
             ],
         }]);
-        for algorithm in [Algorithm::Ion] {
+        for algorithm in [Algorithm::Ion, Algorithm::Fastalloc] {
             let options = RegallocOptions {
                 algorithm,
                 validate_ssa: true,
@@ -151,6 +151,89 @@ fn limited_sparse_registers_and_repeated_uses() {
                 checker.run().unwrap();
             }
         }
+    }
+}
+
+#[test]
+fn limited_operand_precedes_unrestricted_operand() {
+    let env = mach_env(32);
+    let function = RealFunction::new(vec![BlockBuildInfo {
+        insts: vec![
+            vec![op(Def, 0, Reg)],
+            vec![op(Def, 1, Reg)],
+            vec![op(Use, 0, Reg), op(Use, 1, Limit(1))],
+            vec![op(Use, 0, FixedReg(p(0)))],
+        ],
+    }]);
+    let options = RegallocOptions {
+        algorithm: Algorithm::Fastalloc,
+        validate_ssa: true,
+        ..RegallocOptions::default()
+    };
+    let output = run(&function, &env, &options).unwrap();
+    assert_eq!(output.inst_allocs(i(2))[1], alloc(p(0)));
+    #[cfg(feature = "checker")]
+    {
+        let mut checker = crate::checker::Checker::new(&function, &env);
+        checker.prepare(&output);
+        checker.run().unwrap();
+    }
+}
+
+#[test]
+fn limited_early_definition() {
+    let env = mach_env(32);
+    let function = RealFunction::new(vec![BlockBuildInfo {
+        insts: vec![
+            vec![
+                Operand::new(v(0), Limit(1), Def, OperandPos::Early),
+                op(Def, 1, Reg),
+            ],
+            vec![op(Use, 1, FixedReg(p(0))), op(Use, 0, Reg)],
+        ],
+    }]);
+    let options = RegallocOptions {
+        algorithm: Algorithm::Fastalloc,
+        validate_ssa: true,
+        ..RegallocOptions::default()
+    };
+    let output = run(&function, &env, &options).unwrap();
+    assert_eq!(output.inst_allocs(i(0))[0], alloc(p(0)));
+    #[cfg(feature = "checker")]
+    {
+        let mut checker = crate::checker::Checker::new(&function, &env);
+        checker.prepare(&output);
+        checker.run().unwrap();
+    }
+}
+
+#[test]
+fn limited_phase_exclusive_registers() {
+    let env = mach_env(4);
+    let function = RealFunction::new(vec![BlockBuildInfo {
+        insts: vec![
+            vec![op(Def, 0, Reg), op(Def, 1, Reg)],
+            vec![
+                op(Use, 0, Limit(2)),
+                Operand::new(v(1), Limit(4), Use, OperandPos::Late),
+                op(Def, 2, FixedReg(p(0))),
+                Operand::new(v(3), FixedReg(p(2)), Def, OperandPos::Early),
+                Operand::new(v(4), FixedReg(p(3)), Def, OperandPos::Early),
+            ],
+        ],
+    }]);
+    let options = RegallocOptions {
+        algorithm: Algorithm::Fastalloc,
+        validate_ssa: true,
+        ..RegallocOptions::default()
+    };
+    let output = run(&function, &env, &options).unwrap();
+    assert_eq!(&output.inst_allocs(i(1))[..2], &[alloc(p(0)), alloc(p(1))]);
+    #[cfg(feature = "checker")]
+    {
+        let mut checker = crate::checker::Checker::new(&function, &env);
+        checker.prepare(&output);
+        checker.run().unwrap();
     }
 }
 

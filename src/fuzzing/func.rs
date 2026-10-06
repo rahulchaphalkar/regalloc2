@@ -364,6 +364,7 @@ fn has_fixed_def_with(preg: PReg) -> impl Fn(&Operand) -> bool {
 #[derive(Clone, Debug)]
 pub struct Options {
     pub reused_inputs: bool,
+    pub limited_regs: bool,
     pub fixed_regs: bool,
     pub fixed_nonallocatable: bool,
     pub clobbers: bool,
@@ -380,6 +381,7 @@ impl Options {
     /// Default options for generating functions.
     pub const DEFAULT: Self = Self {
         reused_inputs: false,
+        limited_regs: false,
         fixed_regs: false,
         fixed_nonallocatable: false,
         clobbers: false,
@@ -580,6 +582,37 @@ impl Func {
                         63,
                         RegClass::arbitrary(u)?,
                     )));
+                }
+
+                if opts.limited_regs {
+                    for index in 0..operands.len() {
+                        let operand = operands[index];
+                        if !matches!(
+                            operand.constraint(),
+                            OperandConstraint::Any | OperandConstraint::Reg
+                        ) {
+                            continue;
+                        }
+                        if bool::arbitrary(u)? {
+                            let limit = *u.choose(&[1, 2, 4, 8, 16, 32])?;
+                            let pressure = operands
+                                .iter()
+                                .filter(|other| other.class() == operand.class())
+                                .count()
+                                + clobbers
+                                    .iter()
+                                    .filter(|reg| reg.class() == operand.class())
+                                    .count();
+                            if pressure <= limit {
+                                operands[index] = Operand::new(
+                                    operand.vreg(),
+                                    OperandConstraint::Limit(limit),
+                                    operand.kind(),
+                                    operand.pos(),
+                                );
+                            }
+                        }
+                    }
                 }
 
                 builder.add_inst(

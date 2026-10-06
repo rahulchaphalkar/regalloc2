@@ -6,6 +6,7 @@ use arbitrary::{Arbitrary, Result, Unstructured};
 /// `fastalloc`-specific options for generating functions.
 const OPTIONS: func::Options = func::Options {
     reused_inputs: true,
+    limited_regs: true,
     fixed_regs: true,
     fixed_nonallocatable: true,
     clobbers: true,

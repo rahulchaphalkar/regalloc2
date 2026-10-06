@@ -419,6 +419,8 @@ pub struct Env<'a, F: Function> {
     /// `reused_input_to_reuse_op[i]` is the operand index of the reuse operand
     /// that uses the `i`th operand in the current instruction as its input.
     reused_input_to_reuse_op: Vec<usize>,
+    operand_order: Vec<usize>,
+    limited_regs: Vec<PReg>,
     /// Number of operands with any-reg constraints in the current inst
     /// to allocate for
     num_any_reg_ops: PartedByExclusiveOperandPos<PartedByRegClass<i16>>,
@@ -502,6 +504,8 @@ impl<'a, F: Function> Env<'a, F> {
                 ],
             },
             reused_input_to_reuse_op: vec![usize::MAX; max_operand_len as usize],
+            operand_order: Vec::with_capacity(max_operand_len as usize),
+            limited_regs: vec![PReg::invalid(); max_operand_len as usize],
             init_available_pregs,
             init_num_available_pregs: num_available_pregs.clone(),
             num_any_reg_ops: PartedByExclusiveOperandPos {
@@ -642,11 +646,16 @@ impl<'a, F: Function> Env<'a, F> {
                     !alloc.is_none()
                 }
             }
-            OperandConstraint::Reg => {
+            OperandConstraint::Reg | OperandConstraint::Limit(_) => {
                 if self.is_stack(alloc) {
                     return false;
                 }
                 if let Some(preg) = alloc.as_reg() {
+                    if let OperandConstraint::Limit(limit) = op.constraint() {
+                        if preg.hw_enc() >= limit {
+                            return false;
+                        }
+                    }
                     if !self.available_pregs[op.pos()].contains(preg) {
                         trace!("The vreg in {preg}: {}", self.vreg_in_preg[preg.index()]);
                         self.vreg_in_preg[preg.index()] == op.vreg()
@@ -667,9 +676,6 @@ impl<'a, F: Function> Env<'a, F> {
             }
 
             OperandConstraint::Stack => self.is_stack(alloc),
-            OperandConstraint::Limit(_) => {
-                todo!("limit constraints are not yet supported in fastalloc")
-            }
         }
     }
 
@@ -694,7 +700,7 @@ impl<'a, F: Function> Env<'a, F> {
     }
 
     fn select_suitable_reg_in_lru(&self, op: Operand) -> Result<PReg, RegAllocError> {
-        let draw_from = match (op.pos(), op.kind()) {
+        let mut draw_from = match (op.pos(), op.kind()) {
             // No need to consider reuse constraints because they are
             // handled elsewhere
             (OperandPos::Late, OperandKind::Use) | (OperandPos::Early, OperandKind::Def) => {
@@ -702,6 +708,24 @@ impl<'a, F: Function> Env<'a, F> {
             }
             _ => self.available_pregs[op.pos()],
         };
+        if let OperandConstraint::Limit(limit) = op.constraint() {
+            draw_from.intersect_from(self.allocatable_regs);
+            if limit <= PReg::MAX {
+                let mut allowed = PRegSet::empty();
+                allowed.add_up_to(PReg::new(limit, op.class()));
+                draw_from.intersect_from(allowed);
+            }
+            if !matches!(ExclusiveOperandPos::from(op), ExclusiveOperandPos::Both) {
+                let other_pos = match op.pos() {
+                    OperandPos::Early => OperandPos::Late,
+                    OperandPos::Late => OperandPos::Early,
+                };
+                let exclusive = draw_from & self.available_pregs[other_pos].invert();
+                if !exclusive.is_empty(op.class()) {
+                    draw_from = exclusive;
+                }
+            }
+        }
         if draw_from.is_empty(op.class()) {
             trace!("No registers available for {op} in selection");
             return Err(RegAllocError::TooManyLiveRegs);
@@ -779,7 +803,7 @@ impl<'a, F: Function> Env<'a, F> {
                     }
                 }
             }
-            OperandConstraint::Reg => {
+            OperandConstraint::Reg | OperandConstraint::Limit(_) => {
                 let alloc = self.alloc_reg_for_operand(inst, op)?;
                 self.num_any_reg_ops[op.into()][op.class()] -= 1;
                 trace!(
@@ -800,9 +824,6 @@ impl<'a, F: Function> Env<'a, F> {
             }
 
             OperandConstraint::Stack => Allocation::stack(self.get_spillslot(op.vreg())),
-            OperandConstraint::Limit(_) => {
-                todo!("limit constraints are not yet supported in fastalloc")
-            }
         };
         self.allocs[(inst.index(), op_idx)] = new_alloc;
         Ok(new_alloc)
@@ -818,6 +839,17 @@ impl<'a, F: Function> Env<'a, F> {
         op: Operand,
         op_idx: usize,
     ) -> Result<(), RegAllocError> {
+        let op = if matches!(op.constraint(), OperandConstraint::Limit(_)) {
+            self.num_any_reg_ops[op.into()][op.class()] -= 1;
+            Operand::new(
+                op.vreg(),
+                OperandConstraint::FixedReg(self.limited_regs[op_idx]),
+                op.kind(),
+                op.pos(),
+            )
+        } else {
+            op
+        };
         if let Some(preg) = op.as_fixed_nonallocatable() {
             self.allocs[(inst.index(), op_idx)] = Allocation::reg(preg);
             trace!(
@@ -882,7 +914,10 @@ impl<'a, F: Function> Env<'a, F> {
         } else {
             trace!("{op} is already allocated within constraints");
             self.allocs[(inst.index(), op_idx)] = self.vreg_allocs[op.vreg().vreg()];
-            if op.constraint() == OperandConstraint::Reg {
+            if matches!(
+                op.constraint(),
+                OperandConstraint::Reg | OperandConstraint::Limit(_)
+            ) {
                 self.num_any_reg_ops[op.into()][op.class()] -= 1;
                 trace!("{op} is already within constraint. Number of reg-only ops that need to be allocated now: {}", self.num_any_reg_ops[op.into()]);
             }
@@ -1142,6 +1177,85 @@ impl<'a, F: Function> Env<'a, F> {
         Ok(())
     }
 
+    fn reserve_limited_operands(
+        &mut self,
+        operands: &[Operand],
+        inst: Inst,
+    ) -> Result<(), RegAllocError> {
+        self.operand_order.clear();
+        self.operand_order
+            .extend(operands.iter().enumerate().filter_map(|(index, op)| {
+                matches!(op.constraint(), OperandConstraint::Limit(_)).then_some(index)
+            }));
+        let reused_inputs = &self.reused_input_to_reuse_op;
+        self.operand_order.sort_by_key(|&index| {
+            let op = operands[index];
+            let OperandConstraint::Limit(limit) = op.constraint() else {
+                unreachable!()
+            };
+            (
+                limit,
+                !matches!(ExclusiveOperandPos::from(op), ExclusiveOperandPos::Both)
+                    && reused_inputs[index] == usize::MAX,
+            )
+        });
+        for order_index in 0..self.operand_order.len() {
+            let index = self.operand_order[order_index];
+            let op = operands[index];
+            let reuse = self.reused_input_to_reuse_op[index];
+            let shared = self.operand_order[..order_index]
+                .iter()
+                .find_map(|&previous| {
+                    let other = operands[previous];
+                    (reuse == usize::MAX
+                        && self.reused_input_to_reuse_op[previous] == usize::MAX
+                        && op.kind() == OperandKind::Use
+                        && other.kind() == op.kind()
+                        && other.vreg() == op.vreg()
+                        && other.pos() == op.pos())
+                    .then_some(self.limited_regs[previous])
+                });
+            let preg = if let Some(preg) = shared {
+                preg
+            } else {
+                let effective = if reuse == usize::MAX {
+                    op
+                } else {
+                    Operand::new(
+                        op.vreg(),
+                        op.constraint(),
+                        OperandKind::Use,
+                        OperandPos::Late,
+                    )
+                };
+                let preg = self.select_suitable_reg_in_lru(effective)?;
+                self.reserve_reg_for_operand(op, index, preg)?;
+                preg
+            };
+            self.limited_regs[index] = preg;
+            if reuse != usize::MAX {
+                self.limited_regs[reuse] = preg;
+            }
+        }
+        for order_index in 0..self.operand_order.len() {
+            let index = self.operand_order[order_index];
+            let preg = self.limited_regs[index];
+            let reuse = self.reused_input_to_reuse_op[index];
+            let owner = if reuse == usize::MAX {
+                operands[index].vreg()
+            } else {
+                operands[reuse].vreg()
+            };
+            if self.vreg_in_preg[preg.index()] != VReg::invalid()
+                && self.vreg_in_preg[preg.index()] != owner
+            {
+                self.evict_vreg_in_preg(inst, preg, InstPosition::After)?;
+                self.vreg_in_preg[preg.index()] = VReg::invalid();
+            }
+        }
+        Ok(())
+    }
+
     fn alloc_inst(&mut self, block: Block, inst: Inst) -> Result<(), RegAllocError> {
         trace!("Allocating instruction {:?}", inst);
         self.reset_available_pregs_and_scratch_regs();
@@ -1155,7 +1269,10 @@ impl<'a, F: Function> Env<'a, F> {
             if let OperandConstraint::Reuse(reused_idx) = op.constraint() {
                 trace!("Initializing reused_input_to_reuse_op for {op}");
                 self.reused_input_to_reuse_op[reused_idx] = op_idx;
-                if operands.0[reused_idx].constraint() == OperandConstraint::Reg {
+                if matches!(
+                    operands.0[reused_idx].constraint(),
+                    OperandConstraint::Reg | OperandConstraint::Limit(_)
+                ) {
                     trace!(
                         "Counting {op} as an any-reg op that needs a reg in phase {:?}",
                         ExclusiveOperandPos::Both
@@ -1169,7 +1286,10 @@ impl<'a, F: Function> Env<'a, F> {
                     );
                     self.num_any_reg_ops[ExclusiveOperandPos::EarlyOnly][op.class()] -= 1;
                 }
-            } else if op.constraint() == OperandConstraint::Reg {
+            } else if matches!(
+                op.constraint(),
+                OperandConstraint::Reg | OperandConstraint::Limit(_)
+            ) {
                 trace!(
                     "Counting {op} as an any-reg op that needs a reg in phase {:?}",
                     Into::<ExclusiveOperandPos>::into(op)
@@ -1270,19 +1390,12 @@ impl<'a, F: Function> Env<'a, F> {
             self.available_pregs[OperandPos::Late]
         );
 
-        for (op_idx, op) in operands.late() {
+        self.reserve_limited_operands(operands.0, inst)?;
+        for (op_idx, op) in operands.late().chain(operands.early()) {
             if op.kind() == OperandKind::Def {
                 self.alloc_def_op(op_idx, op, operands.0, block, inst)?;
             } else {
                 self.alloc_use(op_idx, op, inst)?;
-            }
-        }
-        for (op_idx, op) in operands.early() {
-            trace!("Allocating use operand {op}");
-            if op.kind() == OperandKind::Use {
-                self.alloc_use(op_idx, op, inst)?;
-            } else {
-                self.alloc_def_op(op_idx, op, operands.0, block, inst)?;
             }
         }
 
